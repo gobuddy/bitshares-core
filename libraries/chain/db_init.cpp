@@ -403,8 +403,20 @@ void database::init_genesis(const genesis_state_type& genesis_state)
       p.chain_id = chain_id;
       p.immutable_parameters = genesis_state.immutable_parameters;
    } );
-   for (uint32_t i = 0; i <= 0x10000; i++)
-      create<block_summary_object>( [&]( block_summary_object&) {});
+   create<block_summary_object>([&](block_summary_object&) {});
+
+   // Create initial accounts from graphene-based chains
+   // graphene accounts can refer to other accounts in their authorities, so
+   // we first create all accounts with dummy authorities, then go back and 
+   // set up the authorities once the accounts all have ids assigned.
+   for( const auto& account : genesis_state.initial_bts_accounts )
+   {
+      account_create_operation cop;
+      cop.name = account.name;
+      cop.registrar = GRAPHENE_TEMP_ACCOUNT;
+      cop.owner = authority(1, GRAPHENE_TEMP_ACCOUNT, 1);
+      account_id_type account_id(apply_operation(genesis_eval_state, cop).get<object_id_type>());
+   }
 
    // Create initial accounts
    for( const auto& account : genesis_state.initial_accounts )
@@ -443,6 +455,32 @@ void database::init_genesis(const genesis_state_type& genesis_state)
                 ("acct", name));
       return itr->get_id();
    };
+
+   for( const auto& account : genesis_state.initial_bts_accounts )
+   {
+      account_update_operation op;
+      op.account = get_account_id(account.name);
+
+      authority owner_authority;
+      owner_authority.weight_threshold = account.owner_authority.weight_threshold;
+      for (const auto& value : account.owner_authority.account_auths)
+         owner_authority.account_auths.insert(std::make_pair(get_account_id(value.first), value.second));
+      owner_authority.key_auths = account.owner_authority.key_auths;
+      owner_authority.address_auths = account.owner_authority.address_auths;
+
+      op.owner = std::move(owner_authority);
+
+      authority active_authority;
+      active_authority.weight_threshold = account.active_authority.weight_threshold;
+      for (const auto& value : account.active_authority.account_auths)
+         active_authority.account_auths.insert(std::make_pair(get_account_id(value.first), value.second));
+      active_authority.key_auths = account.active_authority.key_auths;
+      active_authority.address_auths = account.active_authority.address_auths;
+      
+      op.active = std::move(active_authority);
+
+      apply_operation(genesis_eval_state, op);
+   }
 
    // Helper function to get asset ID by symbol
    const auto& assets_by_symbol = get_index_type<asset_index>().indices().get<by_symbol>();
@@ -529,6 +567,46 @@ void database::init_genesis(const genesis_state_type& genesis_state)
       });
    }
 
+   // Create balances for all bts accounts
+   for( const auto& account : genesis_state.initial_bts_accounts ) {
+      if (account.core_balance != share_type()) {
+         total_supplies[asset_id_type()] += account.core_balance;
+
+         create<account_balance_object>([&](account_balance_object& b) {
+            b.owner = get_account_id(account.name);
+            b.balance = account.core_balance;
+         });
+      }
+
+      // create any vesting balances for this account
+      if (account.vesting_balances)
+         for (const auto& vesting_balance : *account.vesting_balances) {
+            create<vesting_balance_object>([&](vesting_balance_object& vbo) {
+               vbo.owner = get_account_id(account.name);
+               vbo.balance = asset(vesting_balance.amount, get_asset_id(vesting_balance.asset_symbol));
+               if (vesting_balance.policy_type == "linear") {
+                  auto initial_linear_vesting_policy = vesting_balance.policy.as<genesis_state_type::initial_bts_account_type::initial_linear_vesting_policy>();
+                  linear_vesting_policy new_vesting_policy;
+                  new_vesting_policy.begin_timestamp = initial_linear_vesting_policy.begin_timestamp;
+                  new_vesting_policy.vesting_cliff_seconds = initial_linear_vesting_policy.vesting_cliff_seconds;
+                  new_vesting_policy.vesting_duration_seconds = initial_linear_vesting_policy.vesting_duration_seconds;
+                  new_vesting_policy.begin_balance = initial_linear_vesting_policy.begin_balance;
+                  vbo.policy = new_vesting_policy;
+               } else if (vesting_balance.policy_type == "cdd") {
+                  auto initial_cdd_vesting_policy = vesting_balance.policy.as<genesis_state_type::initial_bts_account_type::initial_cdd_vesting_policy>();
+                  cdd_vesting_policy new_vesting_policy;
+                  new_vesting_policy.vesting_seconds = initial_cdd_vesting_policy.vesting_seconds;
+                  new_vesting_policy.coin_seconds_earned = initial_cdd_vesting_policy.coin_seconds_earned;
+                  new_vesting_policy.start_claim = initial_cdd_vesting_policy.start_claim;
+                  new_vesting_policy.coin_seconds_earned_last_update = initial_cdd_vesting_policy.coin_seconds_earned_last_update;
+                  vbo.policy = new_vesting_policy;
+               }
+               total_supplies[get_asset_id(vesting_balance.asset_symbol)] += vesting_balance.amount;
+            });
+         }
+   }
+
+
    // Create initial balances
    share_type total_allocation;
    for( const auto& handout : genesis_state.initial_balances )
@@ -552,7 +630,7 @@ void database::init_genesis(const genesis_state_type& genesis_state)
 
          linear_vesting_policy policy;
          policy.begin_timestamp = vest.begin_timestamp;
-         policy.vesting_cliff_seconds = 0;
+         policy.vesting_cliff_seconds = vest.vesting_cliff_seconds ? *vest.vesting_cliff_seconds : 0;
          policy.vesting_duration_seconds = vest.vesting_duration_seconds;
          policy.begin_balance = vest.begin_balance;
 
@@ -589,6 +667,7 @@ void database::init_genesis(const genesis_state_type& genesis_state)
             elog( "Genesis for asset ${aname} is not balanced\n"
                   "   Debt is ${debt}\n"
                   "   Supply is ${supply}\n",
+                  ("aname", debt_itr->first)
                   ("debt", debt_itr->second)
                   ("supply", supply_itr->second)
                 );
